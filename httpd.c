@@ -98,9 +98,7 @@ static void dequeue(queue_t *q, int *fd)
      * element after the waiting thread is signaled, but before it can
      * re-acquire head_lock.
      */
-    //while (q->head->next == NULL) //empty, the head is dummy node
     while (q->size == 0) {
-        printf("size is 0, dequeue waiting\n");
         pthread_cond_wait(q->non_empty, q->head_lock);
     }
     
@@ -374,7 +372,6 @@ static void *worker_routine(void *arg)
     while (1) {
     loopstart:
         dequeue(q, &connfd);
-        printf("dequeued\n");
         memset(msg, 0, MAXMSG);
         recv_bytes = 0;
 
@@ -442,7 +439,6 @@ static void *worker_routine(void *arg)
         if (request->protocol_version == 0 || status != STATUS_OK)
             close(connfd);
         else {/* Otherwise, keep connection alive and re-enqueue */
-            printf("worker enqueue\n");
             enqueue(q, connfd);
         }
     }
@@ -466,14 +462,12 @@ void *greeter_routine(void *arg)
     /* Accept connections, set their timeouts, and enqueue them */
     while (1) {
         socklen_t clientlen = sizeof(clientaddr);
-        printf("waiting for connection\n");
         int connfd =
             accept(listfd, (struct sockaddr *) &clientaddr, &clientlen);
         if (connfd < 0) {
             perror("accept");
             continue;
         }
-        printf("received connection\n");
         /* Basic heuristic for timeout based on queue length.
          * Minimum timeout 10s + another second for every 50 connections on the
          * queue.
@@ -485,21 +479,18 @@ void *greeter_routine(void *arg)
         setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, (void *) &timeout,
                    sizeof(timeout));
         enqueue(q, connfd);
-        printf("greeter enqueue\n");
     }
 }
 
 int main()
 {
     queue_t *connections;
-    //pthread_t workers[N_THREADS / 2], greeters[N_THREADS / 2];
-    pthread_t workers[1], greeters[1];
+    pthread_t workers[N_THREADS / 2], greeters[N_THREADS / 2];
     /* Get current working directory */
     char cwd[1024];
     const char *RESOURCES = "/resources";
     if (getcwd(cwd, sizeof(cwd) - sizeof(RESOURCES)/*reserve space for resources*/) == NULL)
         perror("getcwd");
-    printf("%s\n", cwd);
     /* Assign document root */
     DOCUMENT_ROOT = strcat(cwd, RESOURCES);
 
