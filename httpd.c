@@ -381,6 +381,10 @@ static void *worker_routine(void *arg)
                recv_bytes < MAXMSG) {
             if ((len = recv(connfd, msg + recv_bytes, MAXMSG - recv_bytes,
                             0)) <= 0) {
+                if (errno == EAGAIN) {
+                    enqueue(q, connfd);
+                    goto loopstart;
+                }
                 /* If client has closed, then close and move on */
                 if (len == 0) {
                     close(connfd);
@@ -478,6 +482,9 @@ void *greeter_routine(void *arg)
             timeout.tv_sec += n / 50;
         setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, (void *) &timeout,
                    sizeof(timeout));
+        int flag = fcntl(connfd, F_GETFL, 0);
+        flag |= O_NONBLOCK;
+        fcntl(connfd, F_SETFL, flag);
         enqueue(q, connfd);
     }
 }
@@ -485,7 +492,8 @@ void *greeter_routine(void *arg)
 int main()
 {
     queue_t *connections;
-    pthread_t workers[N_THREADS / 2], greeters[N_THREADS / 2];
+    //pthread_t workers[N_THREADS / 2], greeters[N_THREADS / 2];
+    pthread_t workers[1], greeters[N_THREADS / 2];
     /* Get current working directory */
     char cwd[1024];
     const char *RESOURCES = "/resources";
@@ -511,7 +519,8 @@ int main()
     /* Spawn worker threads. These will immediately block until signaled by
      * main server thread pushes connections onto the queue and signals.
      */
-    for (int i = 0; i < N_THREADS / 2; i++)
+    //for (int i = 0; i < N_THREADS / 2; i++)
+    for (int i = 0; i < 1; i++)
         pthread_create(&workers[i], NULL, worker_routine, (void *) connections);
 
     pthread_exit(NULL);
