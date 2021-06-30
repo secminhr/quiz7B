@@ -358,6 +358,13 @@ static int listening_socket()
     return listenfd;
 }
 
+#include <sys/epoll.h>
+
+struct worker_args {
+    queue_t *q;
+    int epollfd;
+};
+
 static void *worker_routine(void *arg)
 {
     pthread_detach(pthread_self());
@@ -366,21 +373,31 @@ static void *worker_routine(void *arg)
     char msg[MAXMSG], buf[1024];
     status_t status;
     http_request_t *request = malloc(sizeof(http_request_t));
-    queue_t *q = (queue_t *) arg;
+    struct worker_args *worker_args = (struct worker_args *) arg;
+    queue_t *q = worker_args->q;
+    int epollfd = worker_args->epollfd;
+    struct epoll_event event[1] = {0};
     struct stat st;
 
     while (1) {
     loopstart:
-        dequeue(q, &connfd);
+        //dequeue(q, &connfd);
+        memset(&event[0], 0, sizeof(event[0]));
+        epoll_wait(epollfd, event, 1, -1);
         memset(msg, 0, MAXMSG);
         recv_bytes = 0;
-
+        connfd = event[0].data.fd;
         /* Loop until full HTTP msg is received */
         while (strstr(strndup(msg, recv_bytes), "\r\n\r\n") == NULL &&
                strstr(strndup(msg, recv_bytes), "\n\n") == NULL &&
                recv_bytes < MAXMSG) {
             if ((len = recv(connfd, msg + recv_bytes, MAXMSG - recv_bytes,
                             0)) <= 0) {
+                if (errno == EAGAIN) {
+                    abort();
+                    //enqueue(q, connfd);
+                    //goto loopstart;
+                }
                 /* If client has closed, then close and move on */
                 if (len == 0) {
                     close(connfd);
@@ -390,7 +407,8 @@ static void *worker_routine(void *arg)
                  * error message
                  */
                 if (errno == EWOULDBLOCK) {
-                    status = STATUS_REQUEST_TIMEOUT;
+                    abort();
+                    //status = STATUS_REQUEST_TIMEOUT;
                 } else {
                     status = STATUS_SERVER_ERROR;
                     perror("recv");
@@ -399,7 +417,11 @@ static void *worker_routine(void *arg)
             }
             recv_bytes += len;
         }
-
+        struct epoll_event ev = {
+            .events = EPOLLIN | EPOLLET | EPOLLONESHOT,
+            .data.fd = connfd
+        };
+        epoll_ctl(epollfd, EPOLL_CTL_MOD, connfd, &ev);
         /* Parse (complete) message */
         status = parse_request(msg, request);
 
@@ -439,7 +461,7 @@ static void *worker_routine(void *arg)
         if (request->protocol_version == 0 || status != STATUS_OK)
             close(connfd);
         else {/* Otherwise, keep connection alive and re-enqueue */
-            enqueue(q, connfd);
+            //enqueue(q, connfd);
         }
     }
     return NULL;
@@ -447,6 +469,7 @@ static void *worker_routine(void *arg)
 
 struct greeter_args {
     int listfd;
+    int epollfd;
     queue_t *q;
 };
 
@@ -454,6 +477,7 @@ void *greeter_routine(void *arg)
 {
     struct greeter_args *ga = (struct greeter_args *) arg;
     int listfd = ga->listfd;
+    int epollfd = ga->epollfd;
     queue_t *q = ga->q;
 
     struct sockaddr_in clientaddr;
@@ -478,14 +502,25 @@ void *greeter_routine(void *arg)
             timeout.tv_sec += n / 50;
         setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, (void *) &timeout,
                    sizeof(timeout));
-        enqueue(q, connfd);
+        int flag = fcntl(connfd, F_GETFL, 0);
+        flag |= O_NONBLOCK;
+        fcntl(connfd, F_SETFL, flag);
+        
+        struct epoll_event event = {
+            .events = EPOLLIN | EPOLLET | EPOLLONESHOT,
+            .data.fd = connfd
+        };
+        epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &event);
+        
+        //enqueue(q, connfd);
     }
 }
 
 int main()
 {
     queue_t *connections;
-    pthread_t workers[N_THREADS / 2], greeters[N_THREADS / 2];
+    //pthread_t workers[N_THREADS / 2], greeters[N_THREADS / 2];
+    pthread_t workers[1], greeters[N_THREADS / 2];
     /* Get current working directory */
     char cwd[1024];
     const char *RESOURCES = "/resources";
@@ -501,8 +536,10 @@ int main()
     /* Initialize listening socket */
     int listfd = listening_socket();
 
+    int epollfd = epoll_create(1);
+
     /* Package arguments for greeter threads */
-    struct greeter_args ga = {.listfd = listfd, .q = connections};
+    struct greeter_args ga = {.listfd = listfd, .epollfd = epollfd, .q = connections};
 
     /* Spawn greeter threads. */
     for (int i = 0; i < N_THREADS / 2; i++)
@@ -511,9 +548,13 @@ int main()
     /* Spawn worker threads. These will immediately block until signaled by
      * main server thread pushes connections onto the queue and signals.
      */
-    for (int i = 0; i < N_THREADS / 2; i++)
-        pthread_create(&workers[i], NULL, worker_routine, (void *) connections);
-
+    struct worker_args wa = {
+        .q = connections,
+        .epollfd = epollfd
+    };
+    //for (int i = 0; i < N_THREADS / 2; i++)
+    for (int i = 0; i < 1; i++)
+        pthread_create(&workers[i], NULL, worker_routine, (void *) (&wa));
     pthread_exit(NULL);
     return 0;
 }
