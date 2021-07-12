@@ -10,106 +10,9 @@ const char *DOCUMENT_ROOT;
 
 #include <pthread.h>
 
-typedef struct __node {
-    int fd;
-    struct __node *next;
-} node_t;
-
-typedef struct {
-    node_t *head, *tail;
-    pthread_mutex_t *head_lock, *tail_lock; /* guards head and tail */
-    pthread_cond_t *non_empty;
-    int size; /* only used for connection timeout heuristic */
-} queue_t;
-
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-
-/* Simple two-lock concurrent queue described in the paper:
- * http://www.cs.rochester.edu/~scott/papers/1996_PODC_queues.pdf
- * The queue uses a head lock to protect concurrent dequeues and a tail lock
- * to protect concurrent enqueues. Enqueue always succeeds, and their
- * dequeue method may do nothing and return false if it sees that the queue
- * may be empty.
- */
-void queue_init(queue_t *q)
-{
-    node_t *dummy;
-    pthread_mutex_t *head_lock, *tail_lock;
-    pthread_cond_t *non_empty;
-
-    if (!(dummy = malloc(sizeof(node_t)))) /* Out of memory */
-        goto exit;
-    if (!(head_lock = malloc(sizeof(pthread_mutex_t)))) /* Out of memory */
-        goto cleanup_dummy;
-    if (!(tail_lock = malloc(sizeof(pthread_mutex_t)))) /* Out of memory */
-        goto cleanup_head_lock;
-    if (!(non_empty = malloc(sizeof(pthread_cond_t)))) /* Out of memory */
-        goto cleanup_tail_lock;
-    if (pthread_mutex_init(head_lock, NULL) ||
-        pthread_mutex_init(tail_lock, NULL)) /* Fail to initialize mutex */
-        goto cleanup_non_empty;
-
-    dummy->next = NULL;
-    q->head = (q->tail = dummy);
-    q->head_lock = head_lock, q->tail_lock = tail_lock;
-    q->non_empty = non_empty;
-    pthread_cond_init(q->non_empty, NULL);
-
-    q->size = 0;
-    return;
-
-cleanup_non_empty:
-    free(non_empty);
-cleanup_tail_lock:
-    free(tail_lock);
-cleanup_head_lock:
-    free(head_lock);
-cleanup_dummy:
-    free(dummy);
-exit:
-    exit(1);
-}
-
-static void enqueue(queue_t *q, int fd)
-{
-    /* Construct new node */
-    node_t *node = malloc(sizeof(node_t));
-    node->fd = fd, node->next = NULL;
-
-    pthread_mutex_lock(q->tail_lock);
-    /* Add node to end of queue */
-    q->tail->next = node;
-    q->tail = node;
-    q->size++;
-
-    /* Wake any sleeping worker threads */
-    pthread_cond_signal(q->non_empty);
-    pthread_mutex_unlock(q->tail_lock);
-}
-
-static void dequeue(queue_t *q, int *fd)
-{
-    node_t *old_head;
-    pthread_mutex_lock(q->head_lock);
-    /* Wait until signaled that queue is non_empty.
-     * Need while loop in case a new thread manages to steal the queue
-     * element after the waiting thread is signaled, but before it can
-     * re-acquire head_lock.
-     */
-    while (q->size == 0) {
-        pthread_cond_wait(q->non_empty, q->head_lock);
-    }
-    
-    node_t *node = q->head->next;
-    *fd = node->fd;
-    old_head = q->head;
-    q->head = node;    
-    q->size--;
-    pthread_mutex_unlock(q->head_lock);
-    free(old_head);
-}
 
 typedef int status_t;
 enum {
@@ -360,11 +263,6 @@ static int listening_socket()
 
 #include <sys/epoll.h>
 
-struct worker_args {
-    queue_t *q;
-    int epollfd;
-};
-
 static void *worker_routine(void *arg)
 {
     pthread_detach(pthread_self());
@@ -373,15 +271,12 @@ static void *worker_routine(void *arg)
     char msg[MAXMSG], buf[1024];
     status_t status;
     http_request_t *request = malloc(sizeof(http_request_t));
-    struct worker_args *worker_args = (struct worker_args *) arg;
-    queue_t *q = worker_args->q;
-    int epollfd = worker_args->epollfd;
+    int epollfd = *((int *)arg);
     struct epoll_event event[1] = {0};
     struct stat st;
 
     while (1) {
     loopstart:
-        //dequeue(q, &connfd);
         memset(&event[0], 0, sizeof(event[0]));
         epoll_wait(epollfd, event, 1, -1);
         memset(msg, 0, MAXMSG);
@@ -395,8 +290,6 @@ static void *worker_routine(void *arg)
                             0)) <= 0) {
                 if (errno == EAGAIN) {
                     abort();
-                    //enqueue(q, connfd);
-                    //goto loopstart;
                 }
                 /* If client has closed, then close and move on */
                 if (len == 0) {
@@ -408,9 +301,21 @@ static void *worker_routine(void *arg)
                  */
                 if (errno == EWOULDBLOCK) {
                     abort();
-                    //status = STATUS_REQUEST_TIMEOUT;
                 } else {
                     status = STATUS_SERVER_ERROR;
+                    printf("printing recv error: %d\n", errno);
+                    switch (errno) {
+                    case EAGAIN: printf("EAGAIN or EWOULDBLOCK\n"); break;
+                    case EBADF: printf("EBADF\n"); break;
+                    case ECONNREFUSED: printf("ECONNREFUSED\n"); break;
+                    case EFAULT: printf("EFAULT\n"); break;
+                    case EINTR: printf("EINTR\n"); break;
+                    case EINVAL: printf("EINVAL\n"); break;
+                    case ENOMEM: printf("ENOMEM\n"); break;
+                    case ENOTCONN: printf("ENOTCONN\n"); break;
+                    case ENOTSOCK: printf("ENOTSOCK\n"); break;
+                    default: printf("errno: %d", errno);
+                    }
                     perror("recv");
                 }
                 goto send;
@@ -470,7 +375,6 @@ static void *worker_routine(void *arg)
 struct greeter_args {
     int listfd;
     int epollfd;
-    queue_t *q;
 };
 
 void *greeter_routine(void *arg)
@@ -478,11 +382,8 @@ void *greeter_routine(void *arg)
     struct greeter_args *ga = (struct greeter_args *) arg;
     int listfd = ga->listfd;
     int epollfd = ga->epollfd;
-    queue_t *q = ga->q;
 
     struct sockaddr_in clientaddr;
-    struct timeval timeout;
-
     /* Accept connections, set their timeouts, and enqueue them */
     while (1) {
         socklen_t clientlen = sizeof(clientaddr);
@@ -492,16 +393,6 @@ void *greeter_routine(void *arg)
             perror("accept");
             continue;
         }
-        /* Basic heuristic for timeout based on queue length.
-         * Minimum timeout 10s + another second for every 50 connections on the
-         * queue.
-         */
-        int n = q->size;
-        timeout.tv_sec = 10;
-        if (n > 0)
-            timeout.tv_sec += n / 50;
-        setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, (void *) &timeout,
-                   sizeof(timeout));
         int flag = fcntl(connfd, F_GETFL, 0);
         flag |= O_NONBLOCK;
         fcntl(connfd, F_SETFL, flag);
@@ -511,16 +402,13 @@ void *greeter_routine(void *arg)
             .data.fd = connfd
         };
         epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &event);
-        
-        //enqueue(q, connfd);
     }
 }
 
 int main()
 {
-    queue_t *connections;
-    //pthread_t workers[N_THREADS / 2], greeters[N_THREADS / 2];
-    pthread_t workers[1], greeters[N_THREADS / 2];
+    pthread_t workers[N_THREADS / 2], greeters[N_THREADS / 2];
+    //pthread_t workers[1], greeters[N_THREADS / 2];
     /* Get current working directory */
     char cwd[1024];
     const char *RESOURCES = "/resources";
@@ -529,17 +417,13 @@ int main()
     /* Assign document root */
     DOCUMENT_ROOT = strcat(cwd, RESOURCES);
 
-    /* Initalize connections queue */
-    connections = malloc(sizeof(queue_t));
-    queue_init(connections);
-
     /* Initialize listening socket */
     int listfd = listening_socket();
 
     int epollfd = epoll_create(1);
 
     /* Package arguments for greeter threads */
-    struct greeter_args ga = {.listfd = listfd, .epollfd = epollfd, .q = connections};
+    struct greeter_args ga = {.listfd = listfd, .epollfd = epollfd};
 
     /* Spawn greeter threads. */
     for (int i = 0; i < N_THREADS / 2; i++)
@@ -548,13 +432,9 @@ int main()
     /* Spawn worker threads. These will immediately block until signaled by
      * main server thread pushes connections onto the queue and signals.
      */
-    struct worker_args wa = {
-        .q = connections,
-        .epollfd = epollfd
-    };
-    //for (int i = 0; i < N_THREADS / 2; i++)
-    for (int i = 0; i < 1; i++)
-        pthread_create(&workers[i], NULL, worker_routine, (void *) (&wa));
+    for (int i = 0; i < N_THREADS / 2; i++)
+    //for (int i = 0; i < 1; i++)
+        pthread_create(&workers[i], NULL, worker_routine, (void *) (&epollfd));
     pthread_exit(NULL);
     return 0;
 }
